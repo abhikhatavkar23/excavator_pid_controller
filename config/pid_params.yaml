@@ -1,0 +1,16 @@
+excavator_pid_controller_node:
+  ros__parameters:
+    control_frequency: 50.0
+
+    goal_topic: "/goal_pose"
+    joint_states_topic: "/joint_states" 
+    command_topic: "/deltacan" 
+
+    large_error_threshold: 0.5 
+    medium_error_threshold: 0.25
+    small_error_threshold: 0.02
+
+    #Power Levels (from 0.45 to 1.0)
+    large_error_power: 0.8
+    medium_error_power: 0.6
+    small_error_power: 0.47
