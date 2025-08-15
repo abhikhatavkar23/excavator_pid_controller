@@ -8,7 +8,7 @@ excavator_pid_controller_node:
 
     large_error_threshold: 0.5 
     medium_error_threshold: 0.25
-    small_error_threshold: 0.02
+    small_error_threshold: 0.01
 
     #Power Levels (from 0.45 to 1.0)
     large_error_power: 0.8
