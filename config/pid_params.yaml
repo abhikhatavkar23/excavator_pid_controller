@@ -6,11 +6,64 @@ excavator_pid_controller_node:
     joint_states_topic: "/joint_states" 
     command_topic: "/deltacan" 
 
-    large_error_threshold: 0.5 
-    medium_error_threshold: 0.25
-    small_error_threshold: 0.01
+    boom:
+      kp: 1.5
+      kd: 0.4
+    arm:
+      kp: 1.8
+      kd: 0.5
+    bucket:
+      kp: 1.0
+      kd: 0.2
 
-    #Power Levels (from 0.45 to 1.0)
-    large_error_power: 0.8
-    medium_error_power: 0.6
-    small_error_power: 0.47
+    # If error is less than this, command is 0
+    goal_tolerance: 0.02
+    # minimum power to send to overcome the hardware deadband.
+    deadband_minimum_power: 0.5
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# excavator_pid_controller_node:
+#   ros__parameters:
+#     control_frequency: 50.0
+
+#     goal_topic: "/goal_pose"
+#     joint_states_topic: "/joint_states" 
+#     command_topic: "/deltacan" 
+
+#     large_error_threshold: 0.5 
+#     medium_error_threshold: 0.25
+#     small_error_threshold: 0.01
+
+#     #Power Levels (from 0.45 to 1.0)
+#     large_error_power: 0.8
+#     medium_error_power: 0.6
+#     small_error_power: 0.47

@@ -12,39 +12,42 @@ class ControlState(Enum):
     MOVING_ARM = 2
     MOVING_BUCKET = 3
 
-class PIDControllerNode(Node):
+class PDControllerNode(Node):
     def __init__(self):
-        super().__init__('excavator_pid_controller_node')
+        super().__init__('excavator_pd_controller_node')
+
         self.declare_parameter('control_frequency', 50.0)
         self.declare_parameter('goal_topic', '/goal_pose')
         self.declare_parameter('joint_states_topic', '/joint_states')
         self.declare_parameter('command_topic', '/deltacan')
 
-        # Parameters for proportional control
-        self.declare_parameter('large_error_threshold', 0.5)
-        self.declare_parameter('medium_error_threshold', 0.25)
-        self.declare_parameter('small_error_threshold', 0.05)
-        self.declare_parameter('large_error_power', 0.8)
-        self.declare_parameter('medium_error_power', 0.6)
-        self.declare_parameter('small_error_power', 0.48)
+        self.declare_parameter('boom.kp', 1.5)
+        self.declare_parameter('boom.kd', 0.4)
+        self.declare_parameter('arm.kp', 1.8)
+        self.declare_parameter('arm.kd', 0.5)
+        self.declare_parameter('bucket.kp', 1.0)
+        self.declare_parameter('bucket.kd', 0.2)
 
-        # get parameters
+        self.declare_parameter('goal_tolerance', 0.05)
+        self.declare_parameter('deadband_minimum_power', 0.45)
+
         self.control_frequency = self.get_parameter('control_frequency').value
         goal_topic = self.get_parameter('goal_topic').value
         joint_states_topic = self.get_parameter('joint_states_topic').value
         command_topic = self.get_parameter('command_topic').value
         
-        self.control_params = {
-            'large_error': self.get_parameter('large_error_threshold').value,
-            'medium_error': self.get_parameter('medium_error_threshold').value,
-            'small_error': self.get_parameter('small_error_threshold').value,
-            'large_power': self.get_parameter('large_error_power').value,
-            'medium_power': self.get_parameter('medium_error_power').value,
-            'small_error_power': self.get_parameter('small_error_power').value,
+        self.pd_gains = {
+            'boom': {'kp': self.get_parameter('boom.kp').value, 'kd': self.get_parameter('boom.kd').value},
+            'arm':  {'kp': self.get_parameter('arm.kp').value, 'kd': self.get_parameter('arm.kd').value},
+            'bucket': {'kp': self.get_parameter('bucket.kp').value, 'kd': self.get_parameter('bucket.kd').value}
         }
+        
+        self.goal_tolerance = self.get_parameter('goal_tolerance').value
+        self.deadband_min_power = self.get_parameter('deadband_minimum_power').value
 
         self.current_positions = {'boom': 0.0, 'arm': 0.0, 'bucket': 0.0}
         self.goal_positions = None
+        self.last_error = {'boom': 0.0, 'arm': 0.0, 'bucket': 0.0}
         self.control_state = ControlState.IDLE
         
         self.joint_indices = {}
@@ -62,14 +65,14 @@ class PIDControllerNode(Node):
         self.timer_period = 1.0 / self.control_frequency
         self.control_timer = self.create_timer(self.timer_period, self.compute_and_publish_control)
         
-        self.get_logger().info("✅ Excavator Sequential Controller has started.")
+        self.get_logger().info("Excavator Sequential PD Controller has started.")
         self.get_logger().info(f"Listening for goals on: {goal_topic}")
 
     def goal_callback(self, msg):
         if len(msg.data) == 3:
             self.goal_positions = {'boom': msg.data[0], 'arm': msg.data[1], 'bucket': msg.data[2]}
             self.control_state = ControlState.MOVING_BOOM
-            self.get_logger().info(f"🎯 New goal received. Starting sequence: MOVING_BOOM")
+            self.get_logger().info(f"New goal received. Starting sequence: MOVING_BOOM")
         else:
             self.get_logger().warning(f"Received goal with {len(msg.data)} elements, expected 3.")
 
@@ -92,6 +95,23 @@ class PIDControllerNode(Node):
             self.goal_positions = self.current_positions.copy()
             self.get_logger().info(f"Initialized goal to current positions.")
 
+    def calculate_pd_command(self, joint_name):
+        error = self.goal_positions[joint_name] - self.current_positions[joint_name]
+        final_command = 0.0
+
+        if abs(error) > self.goal_tolerance:
+            p_term = self.pd_gains[joint_name]['kp'] * error
+            derivative_error = (error - self.last_error[joint_name]) / self.timer_period
+            d_term = self.pd_gains[joint_name]['kd'] * derivative_error
+            pd_output = p_term + d_term
+            
+            sign = np.sign(pd_output)
+            power_with_deadband = max(self.deadband_min_power, abs(pd_output))
+            final_command = np.clip(sign * power_with_deadband, -1.0, 1.0)
+
+        self.last_error[joint_name] = error
+        return final_command
+
     def compute_and_publish_control(self):
         if self.goal_positions is None or self.control_state == ControlState.IDLE:
             return
@@ -102,23 +122,21 @@ class PIDControllerNode(Node):
         boom_cmd, arm_cmd, bucket_cmd = 0.0, 0.0, 0.0
         
         if self.control_state == ControlState.MOVING_BOOM:
-            error = self.goal_positions['boom'] - self.current_positions['boom']
-            boom_cmd = self.calculate_power(error)
-            if abs(error) < self.control_params['small_error']:
+            boom_cmd = self.calculate_pd_command('boom')
+            # If command is zero, it means we've reached the goal
+            if np.isclose(boom_cmd, 0.0):
                 self.control_state = ControlState.MOVING_ARM
                 self.get_logger().info("Boom goal reached. Transitioning to MOVING_ARM.")
         
         elif self.control_state == ControlState.MOVING_ARM:
-            error = self.goal_positions['arm'] - self.current_positions['arm']
-            arm_cmd = self.calculate_power(error)
-            if abs(error) < self.control_params['small_error']:
+            arm_cmd = self.calculate_pd_command('arm')
+            if np.isclose(arm_cmd, 0.0):
                 self.control_state = ControlState.MOVING_BUCKET
                 self.get_logger().info("Arm goal reached. Transitioning to MOVING_BUCKET.")
 
         elif self.control_state == ControlState.MOVING_BUCKET:
-            error = self.goal_positions['bucket'] - self.current_positions['bucket']
-            bucket_cmd = self.calculate_power(error)
-            if abs(error) < self.control_params['small_error']:
+            bucket_cmd = self.calculate_pd_command('bucket')
+            if np.isclose(bucket_cmd, 0.0):
                 self.control_state = ControlState.IDLE
                 self.get_logger().info("Bucket goal reached. Sequence complete. Entering IDLE state.")
 
@@ -128,21 +146,9 @@ class PIDControllerNode(Node):
         
         self.command_publisher.publish(cmd_msg)
 
-    def calculate_power(self, error):
-        abs_error = abs(error)
-        power = 0.0
-        if abs_error > self.control_params['large_error']:
-            power = self.control_params['large_power']
-        elif abs_error > self.control_params['medium_error']:
-            power = self.control_params['medium_power']
-        elif abs_error > self.control_params['small_error']:
-            power = self.control_params['small_error_power']
-        
-        return power * np.sign(error)
-
 def main(args=None):
     rclpy.init(args=args)
-    node = PIDControllerNode()
+    node = PDControllerNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
