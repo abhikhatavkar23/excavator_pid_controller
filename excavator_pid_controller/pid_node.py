@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Bool
 from deltacan.msg import DeltaCan
 import numpy as np
 from enum import Enum
@@ -16,11 +16,14 @@ class PDControllerNode(Node):
     def __init__(self):
         super().__init__('excavator_pd_controller_node')
 
+        #Parameters
         self.declare_parameter('control_frequency', 50.0)
         self.declare_parameter('goal_topic', '/goal_pose')
         self.declare_parameter('joint_states_topic', '/joint_states')
         self.declare_parameter('command_topic', '/deltacan')
+        self.declare_parameter('safety_topic', '/kinematic_safety')
 
+        # PD Gains
         self.declare_parameter('boom.kp', 1.5)
         self.declare_parameter('boom.kd', 0.4)
         self.declare_parameter('arm.kp', 1.8)
@@ -28,13 +31,16 @@ class PDControllerNode(Node):
         self.declare_parameter('bucket.kp', 1.0)
         self.declare_parameter('bucket.kd', 0.2)
 
+        #Thresholds 
         self.declare_parameter('goal_tolerance', 0.05)
         self.declare_parameter('deadband_minimum_power', 0.45)
 
+        # Get parameters
         self.control_frequency = self.get_parameter('control_frequency').value
         goal_topic = self.get_parameter('goal_topic').value
         joint_states_topic = self.get_parameter('joint_states_topic').value
         command_topic = self.get_parameter('command_topic').value
+        safety_topic = self.get_parameter('safety_topic').value
         
         self.pd_gains = {
             'boom': {'kp': self.get_parameter('boom.kp').value, 'kd': self.get_parameter('boom.kd').value},
@@ -49,6 +55,7 @@ class PDControllerNode(Node):
         self.goal_positions = None
         self.last_error = {'boom': 0.0, 'arm': 0.0, 'bucket': 0.0}
         self.control_state = ControlState.IDLE
+        self.is_safe_to_move = False
         
         self.joint_indices = {}
         self.joint_names_to_find = ['swing_to_boom', 'boom_to_arm', 'arm_to_bucket']
@@ -62,17 +69,35 @@ class PDControllerNode(Node):
         self.command_publisher = self.create_publisher(
             DeltaCan, command_topic, 10)
             
+        self.safety_subscriber = self.create_subscription(
+            Bool, safety_topic, self.safety_callback, 10)
+            
         self.timer_period = 1.0 / self.control_frequency
         self.control_timer = self.create_timer(self.timer_period, self.compute_and_publish_control)
         
         self.get_logger().info("Excavator Sequential PD Controller has started.")
         self.get_logger().info(f"Listening for goals on: {goal_topic}")
+        self.get_logger().info(f"Safety topic active on: {safety_topic}")
+        
+        self.get_logger().info(
+            'Example Goal: ros2 topic pub --once /goal_pose std_msgs/msg/Float64MultiArray '
+            '"{data: [-0.2, -0.3, 0.4]}"'
+        )
+
+    def safety_callback(self, msg: Bool):
+        if self.is_safe_to_move != msg.data:
+            self.is_safe_to_move = msg.data
+            status = "released" if msg.data else "engaged"
+            self.get_logger().warning(f"Safety stop {status}!")
 
     def goal_callback(self, msg):
         if len(msg.data) == 3:
-            self.goal_positions = {'boom': msg.data[0], 'arm': msg.data[1], 'bucket': msg.data[2]}
-            self.control_state = ControlState.MOVING_BOOM
-            self.get_logger().info(f"New goal received. Starting sequence: MOVING_BOOM")
+            if self.is_safe_to_move:
+                self.goal_positions = {'boom': msg.data[0], 'arm': msg.data[1], 'bucket': msg.data[2]}
+                self.control_state = ControlState.MOVING_BOOM
+                self.get_logger().info(f"New goal received. Starting sequence: MOVING_BOOM")
+            else:
+                self.get_logger().warning("Received goal but safety stop is engaged. Ignoring command.")
         else:
             self.get_logger().warning(f"Received goal with {len(msg.data)} elements, expected 3.")
 
@@ -113,36 +138,40 @@ class PDControllerNode(Node):
         return final_command
 
     def compute_and_publish_control(self):
-        if self.goal_positions is None or self.control_state == ControlState.IDLE:
-            return
-            
+        # Always publish a message, even if it's all zeros
         cmd_msg = DeltaCan()
         cmd_msg.header.stamp = self.get_clock().now().to_msg()
         
         boom_cmd, arm_cmd, bucket_cmd = 0.0, 0.0, 0.0
         
-        if self.control_state == ControlState.MOVING_BOOM:
-            boom_cmd = self.calculate_pd_command('boom')
-            # If command is zero, it means we've reached the goal
-            if np.isclose(boom_cmd, 0.0):
-                self.control_state = ControlState.MOVING_ARM
-                self.get_logger().info("Boom goal reached. Transitioning to MOVING_ARM.")
-        
-        elif self.control_state == ControlState.MOVING_ARM:
-            arm_cmd = self.calculate_pd_command('arm')
-            if np.isclose(arm_cmd, 0.0):
-                self.control_state = ControlState.MOVING_BUCKET
-                self.get_logger().info("Arm goal reached. Transitioning to MOVING_BUCKET.")
+        # Only calculate commands if we have a goal and are not idle
+        if self.goal_positions is not None and self.control_state != ControlState.IDLE:
+            if self.control_state == ControlState.MOVING_BOOM:
+                boom_cmd = self.calculate_pd_command('boom')
+                if np.isclose(boom_cmd, 0.0):
+                    self.control_state = ControlState.MOVING_ARM
+                    self.get_logger().info("Boom goal reached. Transitioning to MOVING_ARM.")
+            
+            elif self.control_state == ControlState.MOVING_ARM:
+                arm_cmd = self.calculate_pd_command('arm')
+                if np.isclose(arm_cmd, 0.0):
+                    self.control_state = ControlState.MOVING_BUCKET
+                    self.get_logger().info("Arm goal reached. Transitioning to MOVING_BUCKET.")
 
-        elif self.control_state == ControlState.MOVING_BUCKET:
-            bucket_cmd = self.calculate_pd_command('bucket')
-            if np.isclose(bucket_cmd, 0.0):
-                self.control_state = ControlState.IDLE
-                self.get_logger().info("Bucket goal reached. Sequence complete. Entering IDLE state.")
+            elif self.control_state == ControlState.MOVING_BUCKET:
+                bucket_cmd = self.calculate_pd_command('bucket')
+                if np.isclose(bucket_cmd, 0.0):
+                    self.control_state = ControlState.IDLE
+                    self.get_logger().info("Bucket goal reached. Sequence complete. Entering IDLE state.")
 
         cmd_msg.mboomcmd = -1.0 * boom_cmd
         cmd_msg.marmcmd = arm_cmd
         cmd_msg.mbucketcmd = bucket_cmd
+        
+        if not self.is_safe_to_move:
+            cmd_msg.mboomcmd = 0.0
+            cmd_msg.marmcmd = 0.0
+            cmd_msg.mbucketcmd = 0.0
         
         self.command_publisher.publish(cmd_msg)
 
