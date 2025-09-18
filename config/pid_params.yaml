@@ -3,21 +3,21 @@ excavator_pid_controller_node:
     control_frequency: 50.0
     goal_topic: "/goal_pose"
     joint_states_topic: "/joint_states" 
-    command_topic: "/deltacan"
+    command_topic: "deltacan"
     safety_topic: "/kinematic_safety"
 
     #PD gains
     boom:
-      kp: 1.5
-      kd: 0.4
+      kp: 0.5
+      kd: 0.0
     arm:
-      kp: 1.8
-      kd: 0.5
+      kp: 0.5
+      kd: 0.0
     bucket:
-      kp: 1.0
-      kd: 0.2
+      kp: 0.2
+      kd: 0.01
 
     # If error is less than this, command is 0.
-    goal_tolerance: 0.02
+    goal_tolerance: 0.05
     # The minimum power to send to overcome deadband.
     deadband_minimum_power: 0.5
