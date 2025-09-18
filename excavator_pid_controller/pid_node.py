@@ -138,6 +138,10 @@ class PDControllerNode(Node):
         return final_command
 
     def compute_and_publish_control(self):
+        """
+        Computes control commands sequentially and handles overshooting by
+        reverting to a previous state if a joint moves out of tolerance.
+        """
         # Always publish a message, even if it's all zeros
         cmd_msg = DeltaCan()
         cmd_msg.header.stamp = self.get_clock().now().to_msg()
@@ -146,28 +150,65 @@ class PDControllerNode(Node):
         
         # Only calculate commands if we have a goal and are not idle
         if self.goal_positions is not None and self.control_state != ControlState.IDLE:
+            
+            # State: MOVING_BOOM
             if self.control_state == ControlState.MOVING_BOOM:
-                boom_cmd = self.calculate_pd_command('boom')
-                if np.isclose(boom_cmd, 0.0):
+                boom_error = self.goal_positions['boom'] - self.current_positions['boom']
+                # If within tolerance, transition to the next state
+                if abs(boom_error) < self.goal_tolerance:
                     self.control_state = ControlState.MOVING_ARM
                     self.get_logger().info("Boom goal reached. Transitioning to MOVING_ARM.")
+                else:
+                    # Otherwise, continue to control the boom
+                    boom_cmd = self.calculate_pd_command('boom')
             
+            # State: MOVING_ARM 
             elif self.control_state == ControlState.MOVING_ARM:
-                arm_cmd = self.calculate_pd_command('arm')
-                if np.isclose(arm_cmd, 0.0):
-                    self.control_state = ControlState.MOVING_BUCKET
-                    self.get_logger().info("Arm goal reached. Transitioning to MOVING_BUCKET.")
+                # First, check if the previous joint (boom) has overshot
+                boom_error = self.goal_positions['boom'] - self.current_positions['boom']
+                if abs(boom_error) > self.goal_tolerance:
+                    self.get_logger().warning("Boom overshot! Reverting to MOVING_BOOM state.")
+                    self.control_state = ControlState.MOVING_BOOM
+                    # Recalculate boom command immediately to be more responsive
+                    boom_cmd = self.calculate_pd_command('boom')
+                else:
+                    # If boom is stable, proceed with arm control
+                    arm_error = self.goal_positions['arm'] - self.current_positions['arm']
+                    if abs(arm_error) < self.goal_tolerance:
+                        self.control_state = ControlState.MOVING_BUCKET
+                        self.get_logger().info("Arm goal reached. Transitioning to MOVING_BUCKET.")
+                    else:
+                        arm_cmd = self.calculate_pd_command('arm')
 
+            # State: MOVING_BUCKET 
             elif self.control_state == ControlState.MOVING_BUCKET:
-                bucket_cmd = self.calculate_pd_command('bucket')
-                if np.isclose(bucket_cmd, 0.0):
-                    self.control_state = ControlState.IDLE
-                    self.get_logger().info("Bucket goal reached. Sequence complete. Entering IDLE state.")
+                # Check all previous joints for overshoot, starting with the earliest
+                boom_error = self.goal_positions['boom'] - self.current_positions['boom']
+                arm_error = self.goal_positions['arm'] - self.current_positions['arm']
 
+                if abs(boom_error) > self.goal_tolerance:
+                    self.get_logger().warning("Boom overshot! Reverting to MOVING_BOOM state.")
+                    self.control_state = ControlState.MOVING_BOOM
+                    boom_cmd = self.calculate_pd_command('boom')
+                elif abs(arm_error) > self.goal_tolerance:
+                    self.get_logger().warning("Arm overshot! Reverting to MOVING_ARM state.")
+                    self.control_state = ControlState.MOVING_ARM
+                    arm_cmd = self.calculate_pd_command('arm')
+                else:
+                    # If boom and arm are stable, proceed with bucket control
+                    bucket_error = self.goal_positions['bucket'] - self.current_positions['bucket']
+                    if abs(bucket_error) < self.goal_tolerance: 
+                        self.control_state = ControlState.IDLE
+                        self.get_logger().info("Bucket goal reached. Sequence complete. Entering IDLE state.")
+                    else:
+                        bucket_cmd = self.calculate_pd_command('bucket')
+
+        # Publish Commands 
         cmd_msg.mboomcmd = -1.0 * boom_cmd
         cmd_msg.marmcmd = arm_cmd
         cmd_msg.mbucketcmd = bucket_cmd
         
+        # Apply safety stop if engaged
         if not self.is_safe_to_move:
             cmd_msg.mboomcmd = 0.0
             cmd_msg.marmcmd = 0.0
